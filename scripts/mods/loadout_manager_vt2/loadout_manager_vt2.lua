@@ -5,7 +5,8 @@ local mod = get_mod("loadout_manager_vt2")
 	Allows you to save and restore gear and talent loadouts.
 --]]
 
-local MAX_LOADOUTS = 10
+local NUM_LOADOUT_BUTTONS = 10
+local NUM_LOADOUTS_BUTTONS_PAGES = 3
 local InventorySettings = InventorySettings
 local SPProfiles = SPProfiles
 
@@ -19,7 +20,7 @@ mod.checkbox_theme = nil
 mod.cloud_file = nil
 mod.loadouts_data = nil
 mod.fatshark_view = nil
-mod.is_in_hero_select_popup = false
+mod.profile_picker_info = nil
 mod.loadouts_window = nil
 mod.loadout_details_window = nil
 mod.equipment_queue = {}
@@ -46,6 +47,11 @@ mod.on_all_mods_loaded = function()
 		button_theme.color_text_clicked = Colors.get_color_table_with_alpha("font_default", 255)
 		button_theme.shadow = { layers = 4, border = 0, color = Colors.get_color_table_with_alpha("white", 35) }
 		mod.button_theme = button_theme
+
+		-- Create a style for the next/prev loadouts page buttons.
+		local change_page_button_theme = table.clone(button_theme)
+		change_page_button_theme.shadow = { layers = 0 }
+		mod.change_page_button_theme = change_page_button_theme
 
 		-- Create a style for the title text of the loadout details window.
 		local title_theme = table.merge(table.clone(button_theme), mod.simple_ui.themes.default.textbox)
@@ -78,8 +84,9 @@ end
 -- should be displayed.
 mod.get_hero_and_career = function(self)
 	local fatshark_view = self.fatshark_view
-	if self.is_in_hero_select_popup then
-		return fatshark_view._selected_hero_name, fatshark_view._selected_career_name, fatshark_view._selected_career_index
+	if self.profile_picker_info then
+		local career = self.profile_picker_info.selected_career
+		return self.profile_picker_info.selected_profile.name, career.name, career.index
 	else
 		local profile_index = FindProfileIndex(fatshark_view.hero_name)
 		local profile = SPProfiles[profile_index]
@@ -93,7 +100,7 @@ end
 mod.get_gui_dimensions = function(self)
 	local scale = (UISettings.ui_scale or 100) / 100
 	local gui_size = { math.floor(511 * scale), math.floor(694 * scale) }
-	local align_right = self.is_in_hero_select_popup
+	local align_right = not not self.profile_picker_info
 	local gui_x_position = math.floor((UIResolutionWidthFragments() - gui_size[1]) / ((align_right and 1) or 2))
 	local gui_y_position = math.floor((UIResolutionHeightFragments() - gui_size[2])/2 + 62*scale)
 	local gui_position = { gui_x_position, gui_y_position }
@@ -125,15 +132,21 @@ mod.create_loadouts_window = function(self)
 		local window_name = "loadoutmgr_loadouts"
 		self.loadouts_window = self.simple_ui:create_window(window_name, window_position, window_size)
 
+		self.loadouts_window.loadouts_page_index = 0
+		local compute_loadout_number = function(button_column)
+			return (self.loadouts_window.loadouts_page_index * NUM_LOADOUT_BUTTONS) + button_column
+		end
+
 		local _, career_name = self:get_hero_and_career()
 		local on_button_click = function(event)
 			local button_column = event.params
-			mod:create_loadout_details_window(button_column)
+			mod:create_loadout_details_window(compute_loadout_number(button_column))
 		end
 		local on_button_right_click = function(button)
 			local button_column = button.params
-			if self:get_loadout(button_column, career_name) then
-				mod:restore_loadout(button_column, career_name)
+			local loadout_number = compute_loadout_number(button_column)
+			if self:get_loadout(loadout_number, career_name) then
+				mod:restore_loadout(loadout_number, career_name)
 				mod:destroy_loadout_details_window()
 			end
 		end
@@ -143,19 +156,47 @@ mod.create_loadouts_window = function(self)
 		local ui_scale = (UISettings.ui_scale or 100) / 100
 		local button_size = { math.floor(33 * ui_scale), math.floor(33 * ui_scale) }
 		local spacing = math.floor(10 * ui_scale)
-		local margin = (window_size[1] - (MAX_LOADOUTS * button_size[1]) - ((MAX_LOADOUTS - 1) * spacing)) / 2
+		local margin = (window_size[1] - (NUM_LOADOUT_BUTTONS * button_size[1]) - ((NUM_LOADOUT_BUTTONS - 1) * spacing)) / 2
 		local y_offset = (loadout_buttons_height - button_size[2]) / 2
-		for button_column = 1, MAX_LOADOUTS do
+		local loadout_buttons = {}
+		for button_column = 1, NUM_LOADOUT_BUTTONS do
 			local x_offset = margin + (button_column - 1) * (button_size[1] + spacing);
-			local column_string = tostring(button_column)
-			local name = (window_name .. "_" .. column_string)
-			local button = self.loadouts_window:create_button(name, {x_offset, y_offset}, button_size, nil, column_string, button_column)
+			local name = (window_name .. "_" .. button_column)
+			local button = self.loadouts_window:create_button(name, {x_offset, y_offset}, button_size, nil, "", button_column)
 			button.theme = self.button_theme
 			button.on_click = on_button_click
 			button.on_right_click = on_button_right_click
-			local loadout = self:get_loadout(button_column, career_name)
-			button.tooltip = "   " .. ((loadout and loadout.name) or self:localize("loadout_details_title_default", button_column))
+			loadout_buttons[button_column] = button
 		end
+
+		-- Add buttons to move between 'pages' of loadout buttons.
+		local btn_x = spacing
+		local prev_page_button = self.loadouts_window:create_button((window_name .. "_prev_btn"), {btn_x, y_offset}, button_size, nil, "", -1)
+		prev_page_button.theme = self.change_page_button_theme
+		btn_x = window_size[1] - button_size[1] - spacing
+		local next_page_button = self.loadouts_window:create_button((window_name .. "_next_btn"), {btn_x, y_offset}, button_size, nil, "", 1)
+		next_page_button.theme = self.change_page_button_theme
+
+		local set_button_texts = function()
+			for button_column = 1, NUM_LOADOUT_BUTTONS do
+				local button = loadout_buttons[button_column]
+				local loadout_number = compute_loadout_number(button_column)
+				button.text = tostring(loadout_number)
+				local loadout = self:get_loadout(loadout_number, career_name)
+				button.tooltip = "   " .. ((loadout and loadout.name) or self:localize("loadout_details_title_default", loadout_number))
+			end
+			prev_page_button.text = (self.loadouts_window.loadouts_page_index > 0 and "<<") or ""
+			next_page_button.text = (self.loadouts_window.loadouts_page_index < (NUM_LOADOUTS_BUTTONS_PAGES - 1) and ">>") or ""
+		end
+		set_button_texts()
+
+		local on_change_page_button_click = function(button)
+			local new_index = self.loadouts_window.loadouts_page_index + button.params
+			self.loadouts_window.loadouts_page_index = math.clamp(new_index, 0, NUM_LOADOUTS_BUTTONS_PAGES - 1)
+			set_button_texts()
+		end
+		prev_page_button.on_click = on_change_page_button_click
+		next_page_button.on_click = on_change_page_button_click
 
 		self.loadouts_window.on_hover_enter = function(window)
 			window:focus()
@@ -174,7 +215,7 @@ mod.create_loadout_details_window = function(self, loadout_number)
 	self:destroy_loadout_details_window()
 
 	local hero_name, career_name, career_index = self:get_hero_and_career()
-	local is_editable = not self.is_in_hero_select_popup
+	local is_editable = not self.profile_picker_info
 
 	local gui_size, gui_position, loadout_buttons_height = self:get_gui_dimensions()
 	local window_height = gui_size[2] - loadout_buttons_height
@@ -329,7 +370,7 @@ mod.create_loadout_details_window = function(self, loadout_number)
 	end
 
 	-- Add the (fatshark) widgets that display the contents of this loadout.
-	local widget_populator = mod.make_loadout_widgets(gear_loadout, talents_loadout, cosmetics_loadout, self.is_in_hero_select_popup)
+	local widget_populator = mod.make_loadout_widgets(gear_loadout, talents_loadout, cosmetics_loadout, not not self.profile_picker_info)
 	window.scenegraph = widget_populator.scenegraph
 	window.fatshark_widgets = widget_populator.fatshark_widgets
 
@@ -372,9 +413,24 @@ mod.destroy_loadout_details_window = function(self)
 	end
 end
 
+-- Returns the collection of loadouts relevant to the current game mode.
+mod.get_loadouts = function(self)
+	local data_root = self.loadouts_data
+	if Managers.mechanism:current_mechanism_name() ~= "deus" then
+		return data_root
+	else
+		local deus_loadouts = data_root.deus_loadouts
+		if not deus_loadouts then
+			deus_loadouts = {}
+			data_root.deus_loadouts = deus_loadouts
+		end
+		return deus_loadouts
+	end
+end
+
 -- Returns the loadout with the given loadout number, for the given career.
 mod.get_loadout = function(self, loadout_number, career_name)
-	return self.loadouts_data[(career_name .. "/" .. tostring(loadout_number))]
+	return self:get_loadouts()[(career_name .. "/" .. tostring(loadout_number))]
 end
 
 -- Modifies and saves the loadout with the given loadout number, for the given
@@ -384,7 +440,7 @@ mod.modify_loadout = function(self, loadout_number, career_name, modifying_funct
 	local loadout = self:get_loadout(loadout_number, career_name)
 	if not loadout then
 		loadout = {}
-		self.loadouts_data[(career_name .. "/" .. tostring(loadout_number))] = loadout
+		self:get_loadouts()[(career_name .. "/" .. tostring(loadout_number))] = loadout
 	end
 	modifying_functor(loadout)
 
@@ -461,7 +517,7 @@ mod.restore_loadout = function(self, loadout_number, career_name, exclude_gear, 
 		self:echo("Error: loadout #"..tostring(loadout_number).." not found for career "..career_name)
 		return
 	end
-	local is_active_career = not self.is_in_hero_select_popup
+	local is_active_career = not self.profile_picker_info
 
 	-- Restore talent selection (code based on HeroWindowTalents.on_exit)
 	local talents_loadout = (not exclude_talents) and loadout.talents
@@ -513,17 +569,17 @@ end
 -- Returns true if the given loadout is the currently selected 'bot override' for
 -- the given career.
 mod.is_bot_override = function(self, loadout_number, career_name, hero_name)
-	local bot_overrides = self.loadouts_data.bot_overrides
+	local bot_overrides = self:get_loadouts().bot_overrides
 	local hero_override = bot_overrides and bot_overrides[hero_name]
 	return hero_override and (hero_override[1] == career_name) and (hero_override[2] == loadout_number)
 end
 
 -- Selects or deselects the given loadout as the 'bot override' for the given career.
 mod.set_bot_override = function(self, loadout_number, career_name, hero_name, is_enabled)
-	local bot_overrides = self.loadouts_data.bot_overrides
+	local bot_overrides = self:get_loadouts().bot_overrides
 	if not bot_overrides then
 		bot_overrides = {}
-		self.loadouts_data.bot_overrides = bot_overrides
+		self:get_loadouts().bot_overrides = bot_overrides
 	end
 	bot_overrides[hero_name] = (is_enabled and { career_name, loadout_number }) or nil
 
@@ -584,39 +640,35 @@ mod:hook(HeroViewStateOverview, "_setup_menu_layout", function(hooked_function, 
 	return use_gamepad_layout
 end)
 
--- Hook PopupJoinLobbyHandler._select_hero to show the loadouts window for the
--- currently selected hero in the popup shown when an alternate hero must be
--- chosen while joining a game.
-mod:hook_safe(PopupJoinLobbyHandler, "_select_hero", function(self, profile_index, career_index, ignore_sound)
-	mod.fatshark_view = self
-	mod.is_in_hero_select_popup = true
-	mod:destroy_windows()
-
-	local active_profile = Managers.player:local_player():profile_index()
-	if profile_index ~= active_profile and not self._occupied_heroes[profile_index] then
-		mod:create_loadouts_window()
+-- -- Hook PopupProfilePicker.update to show the loadouts window for the
+-- -- currently selected hero in the popup shown when an alternate hero must be
+-- -- chosen while joining a game.
+mod:hook_safe(PopupProfilePicker, "update", function(popup, dt, ...)
+	local picker_info = mod.profile_picker_info
+	if not picker_info then
+		picker_info = {}
+		mod.profile_picker_info = picker_info
+		mod.fatshark_view = popup
 	end
+
+	if picker_info.selected_profile ~= popup._selected_profile or picker_info.selected_career ~= popup._selected_career then
+		picker_info.selected_profile = popup._selected_profile
+		picker_info.selected_career = popup._selected_career
+		mod:destroy_windows()
+		
+		if not picker_info.selected_profile.unavailable and not picker_info.selected_career.locked then
+			mod:create_loadouts_window()
+		end
+	end
+
+	draw_fatshark_widgets(popup._ui_top_renderer, StrictNil, popup:input_service(), dt)
 end)
 
--- Hook PopupJoinLobbyHandler.hide to hide the loadouts window.
-mod:hook_safe(PopupJoinLobbyHandler, "hide", function(self)
+-- Hook PopupProfilePicker.hide to hide the loadouts window when the popup goes away.
+mod:hook_safe(PopupProfilePicker, "hide", function(self)
 	mod:destroy_windows()
 	mod.fatshark_view = nil
-	mod.is_in_hero_select_popup = false
-end)
-
--- Hook PopupJoinLobbyHandler.draw to draw the fatshark-style widgets in the
--- loadout details window.
-mod:hook_safe(PopupJoinLobbyHandler, "draw", function(self, ui_top_renderer, input_service, dt)
-	draw_fatshark_widgets(ui_top_renderer, self.render_settings, input_service, dt)
-end)
-
--- Hook PopupJoinLobbyHandler._handle_input to suppress PopupJoinLobbyHandler's
--- handling of right-clicks (which dismisses the popup) since we want to be able
--- to restore loadouts on right-clicks.
-mod:hook(PopupJoinLobbyHandler, "_handle_input", function(hooked_function, self, ...)
-	self:input_service():get("back_menu", true)
-	hooked_function(self, ...)
+	mod.profile_picker_info = nil
 end)
 
 -- Checks whether the next item in the equipment queue can be validly equipped
@@ -709,12 +761,12 @@ end
 
 -- Hook GameModeAdventure._get_first_available_bot_profile to put a bot override loadout
 -- into effect if applicable for the bot.
-mod:hook(GameModeAdventure, "_get_first_available_bot_profile", function(hooked_function, self)
+local function on_bot_spawned(hooked_function, self)
 	local profile_index, career_index = hooked_function(self)
 
 	local profile = SPProfiles[profile_index]
 	local hero_name = profile.display_name
-	local bot_overrides = mod.loadouts_data and mod.loadouts_data.bot_overrides
+	local bot_overrides = mod.loadouts_data and mod:get_loadouts().bot_overrides
 	local bot_override = bot_overrides and bot_overrides[hero_name]
 
 	if bot_override then
@@ -725,14 +777,18 @@ mod:hook(GameModeAdventure, "_get_first_available_bot_profile", function(hooked_
 		check_bot_override_hooks()
 	end
 	return profile_index, career_index
-end)
+end
+mod:hook(GameModeAdventure, "_get_first_available_bot_profile", on_bot_spawned)
+mod:hook(GameModeDeus, "_get_first_available_bot_profile", on_bot_spawned)
 
 -- Hook GameModeAdventure._clear_bots to clear any bot override loadouts in use.
-mod:hook_safe(GameModeAdventure, "_clear_bots", function(self)
+local function on_bots_cleared(self)
 	bot_override_active_count = 0
 	bot_override_loadouts = {}
 	check_bot_override_hooks()
-end)
+end
+mod:hook_safe(GameModeAdventure, "_clear_bots", on_bots_cleared)
+mod:hook_safe(GameModeDeus, "_clear_bots", on_bots_cleared)
 
 -- Hook BackendUtils.get_loadout_item to return the equipment from the bot override
 -- loadout if one is in effect.
